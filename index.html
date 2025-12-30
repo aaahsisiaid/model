@@ -1,162 +1,242 @@
 <!DOCTYPE html>
 <html lang="ja">
 <head>
-<meta charset="UTF-8">
-<title>Head Tracking 3D Viewer (ESM)</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Head Tracking 3D Viewer (モデル読み込み + カメラ許可デバッグ)</title>
 <style>
-html, body {
-  margin: 0;
-  overflow: hidden;
-  background: #000;
-}
-#video {
-  position: fixed;
-  right: 10px;
-  bottom: 10px;
-  width: 160px;
-  opacity: 0.25;
-  z-index: 10;
-}
-canvas {
-  display: block;
-}
+  html,body{height:100%;margin:0;background:#000;color:#fff;font-family:system-ui,Segoe UI,Meiryo;}
+  #ui{position:fixed;left:10px;top:10px;z-index:10;background:rgba(0,0,0,0.5);padding:8px;border-radius:6px}
+  #status{font-size:13px;margin-top:6px;color:#ffeb99}
+  #video{position:fixed;right:10px;bottom:10px;width:160px;opacity:0.25;z-index:9;border-radius:6px}
+  canvas{display:block}
+  input[type=file]{color:#000}
 </style>
 </head>
 <body>
+  <div id="ui">
+    <div>
+      <label>モデル読み込み（.glb/.gltf/.stl）</label><br/>
+      <input id="fileInput" type="file" accept=".glb,.gltf,.stl" />
+    </div>
+    <div id="status">初期化中…</div>
+    <div id="logs" style="margin-top:6px;font-size:12px;color:#ddd;max-width:320px;white-space:pre-wrap;"></div>
+  </div>
 
-<video id="video" autoplay muted playsinline></video>
+  <video id="video" autoplay muted playsinline></video>
 
-<script type="module">
-/* =========================
-   import
-========================= */
-import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
-import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+  <!-- Three.js + Loaders -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/examples/js/loaders/GLTFLoader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/examples/js/loaders/STLLoader.js"></script>
 
-import { FaceMesh } from "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js";
-import { Camera } from "https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js";
+  <!-- MediaPipe FaceMesh -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
 
-/* =========================
-   Three.js 初期化
-========================= */
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x111111);
+  <script>
+  (function(){
+    const statusEl = document.getElementById('status');
+    const logsEl = document.getElementById('logs');
+    function log(...args){ console.log(...args); logsEl.textContent += args.join(' ') + '\n'; logsEl.scrollTop = logsEl.scrollHeight; }
 
-const camera = new THREE.PerspectiveCamera(
-  45,
-  window.innerWidth / window.innerHeight,
-  0.01,
-  100
-);
+    // Three.js セットアップ
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x111111);
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.01, 100);
+    const renderer = new THREE.WebGLRenderer({antialias:true});
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setSize(window.innerWidth, window.innerHeight);
-document.body.appendChild(renderer.domElement);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+    dir.position.set(5,5,5);
+    scene.add(dir);
 
-// Light
-scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
-dirLight.position.set(5, 5, 5);
-scene.add(dirLight);
+    camera.position.set(0,0,5);
 
-// Model
-let model = null;
-const loader = new GLTFLoader();
-loader.load("./model.glb", (gltf) => {
-  model = gltf.scene;
-  model.scale.set(1, 1, 1);
-  scene.add(model);
-});
+    let model = null;
+    const gltfLoader = new THREE.GLTFLoader();
+    const stlLoader  = new THREE.STLLoader();
 
-// 初期カメラ
-camera.position.set(0, 0, 5);
+    function clearModel(){
+      if(!model) return;
+      scene.remove(model);
+      model.traverse?.(o=>{
+        if(o.geometry) o.geometry.dispose();
+        if(o.material){
+          if(Array.isArray(o.material)) o.material.forEach(m=>m.dispose());
+          else o.material.dispose();
+        }
+      });
+      model = null;
+    }
 
-/* =========================
-   FaceMesh
-========================= */
-const video = document.getElementById("video");
+    function fitModel(obj){
+      const box = new THREE.Box3().setFromObject(obj);
+      const size = box.getSize(new THREE.Vector3()).length();
+      const center = box.getCenter(new THREE.Vector3());
+      obj.position.sub(center);
+      // sizeが0の時の対策
+      const s = size < 0.0001 ? 1 : (2 / size);
+      obj.scale.setScalar(s);
+    }
 
-const faceMesh = new FaceMesh({
-  locateFile: (file) =>
-    `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`,
-});
+    document.getElementById('fileInput').addEventListener('change', e=>{
+      const f = e.target.files?.[0];
+      if(!f){ log('ファイル選択キャンセル'); return; }
+      log('選択:', f.name);
+      clearModel();
+      const ext = f.name.split('.').pop().toLowerCase();
+      const url = URL.createObjectURL(f);
+      if(ext === 'glb' || ext === 'gltf'){
+        statusEl.textContent = 'モデル読み込み中（glTF）…';
+        gltfLoader.load(url, gltf=>{
+          model = gltf.scene;
+          fitModel(model);
+          scene.add(model);
+          URL.revokeObjectURL(url);
+          statusEl.textContent = 'モデル読み込み完了: ' + f.name;
+          log('glTF loaded');
+        }, xhr=>{}, err=>{
+          console.error(err);
+          statusEl.textContent = 'glTF 読み込みエラー';
+          log('glTF error:', err);
+        });
+      } else if(ext === 'stl'){
+        statusEl.textContent = 'モデル読み込み中（STL）…';
+        stlLoader.load(url, geometry=>{
+          const mat = new THREE.MeshStandardMaterial({metalness:0.2,roughness:0.6});
+          model = new THREE.Mesh(geometry, mat);
+          fitModel(model);
+          scene.add(model);
+          URL.revokeObjectURL(url);
+          statusEl.textContent = 'STL 読み込み完了: ' + f.name;
+          log('STL loaded');
+        }, xhr=>{}, err=>{
+          console.error(err);
+          statusEl.textContent = 'STL 読み込みエラー';
+          log('STL error:', err);
+        });
+      } else {
+        alert('未対応形式です（.glb/.gltf/.stl のみ）');
+        URL.revokeObjectURL(url);
+      }
+    });
 
-faceMesh.setOptions({
-  maxNumFaces: 1,
-  refineLandmarks: true,
-  minDetectionConfidence: 0.7,
-  minTrackingConfidence: 0.7,
-});
+    // MediaPipe FaceMesh 設定
+    const video = document.getElementById('video');
+    const faceMesh = new FaceMesh({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+    });
 
-// ランドマークID
-const LEFT_EYE = 33;
-const RIGHT_EYE = 263;
+    faceMesh.setOptions({
+      maxNumFaces: 1,
+      refineLandmarks: true,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.6
+    });
 
-// target / filtered
-let tx = 0, ty = 0, tz = 5;
-let fx = 0, fy = 0, fz = 5;
+    let tx=0,ty=0,tz=5, fx=0,fy=0,fz=5;
+    const LEFT_EYE = 33, RIGHT_EYE = 263;
 
-faceMesh.onResults((res) => {
-  if (!res.multiFaceLandmarks) return;
+    faceMesh.onResults(results=>{
+      if(!results.multiFaceLandmarks || !results.multiFaceLandmarks[0]) return;
+      const lm = results.multiFaceLandmarks[0];
+      const le = lm[LEFT_EYE], re = lm[RIGHT_EYE];
+      // もしランドマークが undefined なら早期 return
+      if(!le || !re) return;
+      const cx = (le.x + re.x)/2 - 0.5;
+      const cy = (le.y + re.y)/2 - 0.5;
+      const dx = le.x - re.x;
+      const dy = le.y - re.y;
+      const eyeDist = Math.sqrt(dx*dx + dy*dy) || 0.06;
 
-  const lm = res.multiFaceLandmarks[0];
-  const le = lm[LEFT_EYE];
-  const re = lm[RIGHT_EYE];
+      tx = cx * 3;
+      ty = -cy * 2;
+      // 調整しやすいように clamp と乗数入れておく
+      tz = THREE.MathUtils.clamp((0.06 / eyeDist) , 2.0, 8.0);
+    });
 
-  // 顔中心（-0.5～0.5）
-  const cx = (le.x + re.x) / 2 - 0.5;
-  const cy = (le.y + re.y) / 2 - 0.5;
+    // フレームを faceMesh に送るループ（Camera util は使わない）
+    async function processLoop(){
+      try{
+        if(video.readyState >= 2){
+          await faceMesh.send({image: video});
+        }
+      }catch(err){
+        // MediaPipe 送信エラーをログ
+        console.warn('faceMesh.send error', err);
+      } finally {
+        requestAnimationFrame(processLoop);
+      }
+    }
 
-  // 両目距離 → 奥行き
-  const dx = le.x - re.x;
-  const dy = le.y - re.y;
-  const eyeDist = Math.sqrt(dx * dx + dy * dy);
+    // カメラ取得（明示的に getUserMedia してから再生）
+    async function startCamera(){
+      statusEl.textContent = 'カメラ許可を要求しています…';
+      try{
+        if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+          throw new Error('getUserMedia 未対応のブラウザです');
+        }
+        // localhost では HTTPS 不要。ファイルプロトコルでは動作しない点に注意。
+        const stream = await navigator.mediaDevices.getUserMedia({video:{width:640, height:480}});
+        video.srcObject = stream;
+        await video.play();
+        statusEl.textContent = 'カメラ動作中';
+        log('Camera stream started');
+        // ここから MediaPipe の処理ループ開始
+        processLoop();
+      }catch(e){
+        console.error('カメラ取得エラー', e);
+        statusEl.textContent = 'カメラエラー: ' + (e.message || e.name);
+        log('Camera error: ' + (e.message || e));
+      }
+    }
 
-  // 目標カメラ座標
-  tx = cx * 3.0;
-  ty = -cy * 2.0;
-  tz = THREE.MathUtils.clamp(0.06 / eyeDist, 2.5, 8.0);
-});
+    // アニメーション（レンダリング）
+    function animate(){
+      requestAnimationFrame(animate);
+      fx += (tx - fx) * 0.08;
+      fy += (ty - fy) * 0.08;
+      fz += (tz - fz) * 0.08;
+      camera.position.set(fx, fy, fz);
+      camera.lookAt(0,0,0);
+      renderer.render(scene, camera);
+    }
+    animate();
 
-/* =========================
-   Animation
-========================= */
-function animate() {
-  requestAnimationFrame(animate);
+    // 初期化開始
+    (async ()=>{
+      try{
+        // 1) ブラウザのセキュリティ条件チェック（file:// で開いてないか）
+        if(location.protocol === 'file:'){
+          statusEl.textContent = '警告: file:// ではカメラが動作しません。ローカルサーバーで開いてください（例: python -m http.server）';
+          log('File protocol detected. Serve via http(s) or localhost.');
+        } else {
+          statusEl.textContent = '初期化完了。カメラを開始します…';
+          await startCamera();
+        }
+      }catch(err){
+        console.error('初期化エラー', err);
+        statusEl.textContent = '初期化エラー: ' + err.message;
+        log('Init error: ' + err);
+      }
+    })();
 
-  // スムージング（重要）
-  fx += (tx - fx) * 0.08;
-  fy += (ty - fy) * 0.08;
-  fz += (tz - fz) * 0.08;
+    // ウィンドウリサイズ処理
+    window.addEventListener('resize', ()=>{
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
 
-  camera.position.set(fx, fy, fz);
-  camera.lookAt(0, 0, 0);
+    // デバッグ用に click でカメラ再起動を試せるように
+    statusEl.addEventListener('click', async ()=>{
+      log('manual restart camera');
+      await startCamera();
+    });
 
-  renderer.render(scene, camera);
-}
-animate();
-
-/* =========================
-   Camera start
-========================= */
-const cam = new Camera(video, {
-  onFrame: async () => {
-    await faceMesh.send({ image: video });
-  },
-  width: 640,
-  height: 480,
-});
-cam.start();
-
-/* =========================
-   Resize
-========================= */
-window.addEventListener("resize", () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-});
-</script>
-
+  })();
+  </script>
 </body>
 </html>
